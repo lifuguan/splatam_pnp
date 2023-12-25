@@ -244,7 +244,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
                                              camera_grad=False)
 
     # Initialize Render Variables
-    rendervar = transformed_params2rendervar(params, transformed_pts)
+    rendervar = transformed_params2rendervar(params, transformed_pts)   # 处理一下渲染变量
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_pts)
 
@@ -818,7 +818,7 @@ def rgbd_slam(config: dict):
             mapping_start_time = time.time()
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
-            for iter in range(num_iters_mapping):
+            for iter in range(num_iters_mapping):  # 60 in config file
                 iter_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
                 rand_idx = np.random.randint(0, len(selected_keyframes))
