@@ -12,6 +12,24 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": ["configs/replica/splatam.py"]
+        },
+        {
+            "env": {"CUDA_VISIBLE_DEVICES":"7"},
+            "name": "train: replica-pnp",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/splatam_pnp.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": ["configs/replica/splatam_pnp.py"]
+        },
+        {
+            "name": "dpt",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/preprocess/dpt_depth.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
         }
     ]
 }

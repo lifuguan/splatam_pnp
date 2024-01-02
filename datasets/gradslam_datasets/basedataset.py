@@ -312,6 +312,22 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         color = torch.from_numpy(color)
         K = torch.from_numpy(K)
 
+        if not index == 0:
+            last_frame_color_path = self.color_paths[index - 1]
+            last_frame_depth_path = self.depth_paths[index - 1]
+            last_frame_color = np.asarray(imageio.imread(last_frame_color_path), dtype=float)
+            last_frame_color = self._preprocess_color(last_frame_color)
+            if ".png" in depth_path:
+                # depth_data = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                last_frame_depth = np.asarray(imageio.imread(last_frame_depth_path), dtype=np.int64)
+            elif ".exr" in depth_path:
+                last_frame_depth = readEXR_onlydepth(last_frame_depth_path)
+            if self.distortion is not None:
+                last_frame_color = cv2.undistort(last_frame_color, K, self.distortion)
+            last_frame_color = torch.from_numpy(last_frame_color)
+            last_frame_depth = self._preprocess_depth(last_frame_depth)
+            last_frame_depth = torch.from_numpy(last_frame_depth)
+
         depth = self._preprocess_depth(depth)
         depth = torch.from_numpy(depth)
 
@@ -331,11 +347,22 @@ class GradSLAMDataset(torch.utils.data.Dataset):
                 embedding.to(self.device),  # Allow embedding to be another dtype
                 # self.retained_inds[index].item(),
             )
-
-        return (
-            color.to(self.device).type(self.dtype),
-            depth.to(self.device).type(self.dtype),
-            intrinsics.to(self.device).type(self.dtype),
-            pose.to(self.device).type(self.dtype),
-            # self.retained_inds[index].item(),
-        )
+        if index == 0:
+            return (
+                color.to(self.device).type(self.dtype),
+                depth.to(self.device).type(self.dtype),
+                intrinsics.to(self.device).type(self.dtype),
+                pose.to(self.device).type(self.dtype),
+                # self.retained_inds[index].item(),
+                None,
+                None,
+            )
+        else:
+            return (
+                color.to(self.device).type(self.dtype),
+                depth.to(self.device).type(self.dtype),
+                intrinsics.to(self.device).type(self.dtype),
+                pose.to(self.device).type(self.dtype),
+                last_frame_color.to(self.device).type(self.dtype),
+                last_frame_depth.to(self.device).type(self.dtype),
+            )

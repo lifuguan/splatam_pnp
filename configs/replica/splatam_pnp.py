@@ -15,7 +15,7 @@ mapping_window_size = 24
 tracking_iters = 40
 mapping_iters = 60
 
-group_name = "Replica"
+group_name = "Replica_PNP"
 run_name = f"{scene_name}_{seed}"
 
 config = dict(

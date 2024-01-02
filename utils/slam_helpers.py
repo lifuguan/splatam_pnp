@@ -249,3 +249,64 @@ def transform_to_frame(params, time_idx, gaussians_grad, camera_grad):
     transformed_pts = (rel_w2c @ pts4.T).T[:, :3]
 
     return transformed_pts
+
+def procrustes(S1, S2,weights=None):
+
+    if len(S1.shape)==4:
+        out = procrustes(S1.flatten(0,1),S2.flatten(0,1),weights.flatten(0,1) if weights is not None else None)
+        return out[0],out[1].unflatten(0,S1.shape[:2])
+    '''
+    Computes a similarity transform (sR, t) that takes
+    a set of 3D points S1 (BxNx3) closest to a set of 3D points, S2,
+    where R is an 3x3 rotation matrix, t 3x1 translation, s scale. / mod : assuming scale is 1
+    i.e. solves the orthogonal Procrutes problem.
+    '''
+    with torch.autocast(device_type='cuda', dtype=torch.float32):
+        S1 = S1.permute(0,2,1)
+        S2 = S2.permute(0,2,1)
+        if weights is not None:
+            weights=weights.permute(0,2,1)
+        transposed = True
+
+        if weights is None:
+            weights = torch.ones_like(S1[:,:1])
+
+        # 1. Remove mean.
+        weights_norm = weights/(weights.sum(-1,keepdim=True)+1e-6)
+        mu1 = (S1*weights_norm).sum(2,keepdim=True)
+        mu2 = (S2*weights_norm).sum(2,keepdim=True)
+
+        X1 = S1 - mu1
+        X2 = S2 - mu2
+
+        diags = torch.stack([torch.diag(w.squeeze(0)) for w in weights]) # does batched version exist?
+
+        # 3. The outer product of X1 and X2.
+        K = (X1@diags).bmm(X2.permute(0,2,1))
+
+        # 4. Solution that Maximizes trace(R'K) is R=U*V', where U, V are singular vectors of K.
+        U, s, V = torch.svd(K)
+
+        # Construct Z that fixes the orientation of R to get det(R)=1.
+        Z = torch.eye(U.shape[1], device=S1.device).unsqueeze(0)
+        Z = Z.repeat(U.shape[0],1,1)
+        Z[:,-1, -1] *= torch.sign(torch.det(U.bmm(V.permute(0,2,1))))
+
+        # Construct R.
+        R = V.bmm(Z.bmm(U.permute(0,2,1)))
+
+        # 6. Recover translation.
+        t = mu2 - ((R.bmm(mu1)))
+
+        # 7. Error:
+        S1_hat = R.bmm(S1) + t
+
+        # Combine recovered transformation as single matrix
+        R_=torch.eye(4)[None].expand(S1.size(0),-1,-1).to(S1)
+        R_[:,:3,:3]=R
+        T_=torch.eye(4)[None].expand(S1.size(0),-1,-1).to(S1)
+        T_[:,:3,-1]=t.squeeze(-1)
+        S_=torch.eye(4)[None].expand(S1.size(0),-1,-1).to(S1)
+        transf = T_@S_@R_
+
+        return (S1_hat-S2).square().mean(),transf

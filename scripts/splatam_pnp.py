@@ -16,6 +16,7 @@ for p in sys.path:
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from pytorch3d.transforms import matrix_to_quaternion
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -41,7 +42,7 @@ from utils.keyframe_selection import keyframe_selection_overlap
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
-    transform_to_frame, l1_loss_v1, matrix_to_quaternion
+    transform_to_frame, l1_loss_v1, matrix_to_quaternion, procrustes
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 
@@ -53,24 +54,6 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return ICLDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["replica"]:
         return ReplicaDataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["replicav2"]:
-        return ReplicaV2Dataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["azure", "azurekinect"]:
-        return AzureKinectDataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["scannet"]:
-        return ScannetDataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["ai2thor"]:
-        return Ai2thorDataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["record3d"]:
-        return Record3DDataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["realsense"]:
-        return RealsenseDataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["tum"]:
-        return TUMDataset(config_dict, basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["scannetpp"]:
-        return ScannetPPDataset(basedir, sequence, **kwargs)
-    elif config_dict["dataset_name"].lower() in ["nerfcapture"]:
-        return NeRFCaptureDataset(basedir, sequence, **kwargs)
     else:
         raise ValueError(f"Unknown dataset name {config_dict['dataset_name']}")
 
@@ -173,7 +156,7 @@ def initialize_optimizer(params, lrs_dict, tracking):
 
 def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mean_sq_dist_method, densify_dataset=None):
     # Get RGB-D Data & Camera Parameters
-    color, depth, intrinsics, pose, _, _ = dataset[0]
+    color, depth, intrinsics, pose, last_frame_color, last_frame_depth = dataset[0]
 
     # Process RGB-D Data
     color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
@@ -214,6 +197,46 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mea
     else:
         return params, variables, intrinsics, w2c, cam
 
+def get_render_depth(tracking_data, config):
+    cam = tracking_data['cam']
+    gt_depth = tracking_data['depth']
+    color = tracking_data['im']
+    intrinsics = tracking_data['intrinsics']
+    w2c = torch.eye(4).cuda().float()
+    # Get Initial Point Cloud (PyTorch CUDA Tensor)
+    mask = (gt_depth > 0) # Mask out invalid depth values
+    mask = mask.reshape(-1)
+    init_pt_cld, mean3_sq_dist = get_pointcloud(color, gt_depth, intrinsics, w2c, 
+                                                mask=None, compute_mean_sq_dist=True, 
+                                                mean_sq_dist_method=config['mean_sq_dist_method'])
+
+    # Initialize Parameters
+    params, variables = initialize_params(init_pt_cld, 1, mean3_sq_dist)
+
+    pts = params['means3D'].detach()
+    # Initialize Render Variables
+    rendervar = transformed_params2rendervar(params, pts)   # 处理一下渲染变量
+    depth_sil_rendervar = transformed_params2depthplussilhouette(params, w2c, pts)
+
+    # RGB Rendering
+    rendervar['means2D'].retain_grad()
+    im, radius, _, = Renderer(raster_settings=cam)(**rendervar)
+    variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
+
+    # Depth & Silhouette Rendering
+    depth_sil, _, _, = Renderer(raster_settings=cam)(**depth_sil_rendervar)
+    depth = depth_sil[0, :, :].unsqueeze(0)
+    silhouette = depth_sil[1, :, :]
+    presence_sil_mask = (silhouette > config['tracking']['sil_thres'])
+    depth_sq = depth_sil[2, :, :].unsqueeze(0)
+    uncertainty = depth_sq - depth**2
+    uncertainty = uncertainty.detach()
+
+    # Mask with valid depth values (accounts for outlier depth values)
+    nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
+    mask = mask.reshape(nan_mask.shape) & nan_mask
+    mask = mask & presence_sil_mask
+    return init_pt_cld, depth, mask
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1,ignore_outlier_depth_loss, tracking=False, 
@@ -416,13 +439,17 @@ def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx, mean_sq
 
     return params, variables
 
-
+"""
+这个函数使用一种恒速模型（Constant Velocity Model）来初始化当前帧的相机姿态。
+如果curr_time_idx大于1且forward_prop为True，则使用前两帧的相机姿态来更新当前帧的姿态。
+否则，直接复制前一帧的姿态作为当前帧的姿态。
+"""
 def initialize_camera_pose(params, curr_time_idx, forward_prop):
     with torch.no_grad():
         if curr_time_idx > 1 and forward_prop:
             # Initialize the camera pose for the current frame based on a constant velocity model
             # Rotation
-            prev_rot1 = F.normalize(params['cam_unnorm_rots'][..., curr_time_idx-1].detach())
+            prev_rot1 = F.normalize(params['cam_unnorm_rots'][..., curr_time_idx-1].detach()) 
             prev_rot2 = F.normalize(params['cam_unnorm_rots'][..., curr_time_idx-2].detach())
             new_rot = F.normalize(prev_rot1 + (prev_rot1 - prev_rot2))
             params['cam_unnorm_rots'][..., curr_time_idx] = new_rot.detach()
@@ -632,6 +659,14 @@ def rgbd_slam(config: dict):
     else:
         checkpoint_time_idx = 0
     
+    # load Raft
+    from torchvision.models.optical_flow import Raft_Small_Weights
+    from torchvision.models.optical_flow import raft_small
+    print("making raft")
+    raft_transforms = Raft_Small_Weights.DEFAULT.transforms()
+    raft = raft_small(weights=Raft_Small_Weights.DEFAULT, progress=False).to(device)
+    print("done making raft")
+
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
@@ -640,7 +675,9 @@ def rgbd_slam(config: dict):
         gt_w2c = torch.linalg.inv(gt_pose)
         # Process RGB-D Data
         color = color.permute(2, 0, 1) / 255
+        last_frame_color = last_frame_color.permute(2, 0, 1) / 255 if last_frame_color is not None else None
         depth = depth.permute(2, 0, 1)
+        last_frame_depth = last_frame_depth.permute(2, 0, 1) if last_frame_depth is not None else None
         gt_w2c_all_frames.append(gt_w2c)
         curr_gt_w2c = gt_w2c_all_frames
         # Optimize only current time step for tracking
@@ -648,103 +685,85 @@ def rgbd_slam(config: dict):
         # Initialize Mapping Data for selected frame
         curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': iter_time_idx, 'intrinsics': intrinsics, 
                      'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
-        
-        # Initialize Data for Tracking
-        if seperate_tracking_res:
-            tracking_color, tracking_depth, _, _ = tracking_dataset[time_idx]
-            tracking_color = tracking_color.permute(2, 0, 1) / 255
-            tracking_depth = tracking_depth.permute(2, 0, 1)
-            tracking_curr_data = {'cam': tracking_cam, 'im': tracking_color, 'depth': tracking_depth, 'id': iter_time_idx,
-                                  'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
-        else:
-            tracking_curr_data = curr_data
+        last_frame_data = {'cam': cam, 'im': last_frame_color, 'depth': last_frame_depth, 'id': iter_time_idx,
+                     'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
 
-        # Optimization Iterations
+        tracking_curr_data, tracking_last_data = curr_data, last_frame_data
+
+        # Optimization Iterations (for mapping)
         num_iters_mapping = config['mapping']['num_iters']
         
         # Initialize the camera pose for the current frame
-        if time_idx > 0:
-            params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'])
+        # 因为使用PNP，所以不需要恒定速度模型
+        # if time_idx > 0:
+        #     params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'])
 
         # Tracking
         tracking_start_time = time.time()
-        if time_idx > 0 and not config['tracking']['use_gt_poses']:
-            # Reset Optimizer & Learning Rates for tracking
-            optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
-            # Keep Track of Best Candidate Rotation & Translation
-            candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
-            candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
-            current_min_loss = float(1e20)
-            # Tracking Optimization
-            iter = 0
-            do_continue_slam = False
-            num_iters_tracking = config['tracking']['num_iters']
-            progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
-            while True:
-                iter_start_time = time.time()
-                # Loss for current frame
-                loss, variables, losses = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
-                                                   config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
-                                                   config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
-                                                   plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
-                                                   tracking_iteration=iter)
-                if config['use_wandb']:
-                    # Report Loss
-                    wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
-                # Backprop
-                loss.backward()
-                # Optimizer Update
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    # Save the best candidate rotation & translation
-                    if loss < current_min_loss:
-                        current_min_loss = loss
-                        candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
-                        candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
-                    # Report Progress
-                    if config['report_iter_progress']:
-                        if config['use_wandb']:
-                            report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
-                                            wandb_run=wandb_run, wandb_step=wandb_tracking_step, wandb_save_qual=config['wandb']['save_qual'])
-                        else:
-                            report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
-                    else:
-                        progress_bar.update(1)
-                # Update the runtime numbers
-                iter_end_time = time.time()
-                tracking_iter_time_sum += iter_end_time - iter_start_time
-                tracking_iter_time_count += 1
-                # Check if we should stop tracking
-                iter += 1
-                if iter == num_iters_tracking:
-                    if losses['depth'] < config['tracking']['depth_loss_thres'] and config['tracking']['use_depth_loss_thres']:
-                        break
-                    elif config['tracking']['use_depth_loss_thres'] and not do_continue_slam:
-                        do_continue_slam = True
-                        progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
-                        num_iters_tracking = 2*num_iters_tracking
-                        if config['use_wandb']:
-                            wandb_run.log({"Tracking/Extra Tracking Iters Frames": time_idx,
-                                        "Tracking/step": wandb_time_step})
-                    else:
-                        break
+        if time_idx > 0:
+            track_start_time = time.time()
 
-            progress_bar.close()
+            raft_inputs = raft_transforms(tracking_curr_data['im'].unsqueeze(0), tracking_last_data['im'].unsqueeze(0))
+            optical_flow = raft(raft_inputs[0], raft_inputs[1], num_flow_updates=12)[-1]
+            curr_pts, curr_depth, curr_mask = get_render_depth(tracking_curr_data, config)
+            last_pts, last_depth, last_mask = get_render_depth(tracking_last_data, config)
+            final_mask = curr_mask & last_mask
+            h,w = optical_flow.shape[-2:]
+
+            np_flow = optical_flow[0].permute(1,2,0).detach().cpu().numpy()
+
+            if True:
+                # 计算光流的方向和强度
+                flow_magnitude = np.sqrt(np_flow[:, :, 0] ** 2 + np_flow[:, :, 1] ** 2)
+                flow_angle = np.arctan2(np_flow[:, :, 1], np_flow[:, :, 0])
+
+                # 创建颜色映射
+                cmap = plt.cm.get_cmap('hsv')
+
+                fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                # Plotting depth map a
+                axs[0].imshow(last_depth.detach().cpu()[0], cmap='gray')
+                axs[0].set_title('Last Depth Map')
+
+                # Plotting depth map b
+                axs[1].imshow(curr_depth.detach().cpu()[0], cmap='gray')
+                axs[1].set_title('Current Depth Map')
+
+                # Plotting optical flow map c
+                axs[2].imshow(flow_angle, cmap=cmap) # 使用角度作为颜色映射
+                axs[2].set_title('Optical Flow Map')
+
+                # 可视化光流
+                plt.savefig(f'work_dirs/visualize_{time_idx}.png')
+
+            last_pts = last_pts.reshape(h,w,-1).unsqueeze(0).permute(0,3,1,2)
+            warped_pts = F.grid_sample(last_pts, optical_flow.permute(0,2,3,1), mode='bilinear', padding_mode='border')
+            warped_pts = warped_pts.permute(0,2,3,1).reshape(h*w,-1)[:,:3]
+            warped_pts = warped_pts[final_mask.flatten()].unsqueeze(0)
+
+            # 选择当前帧的点云
+            curr_pts = curr_pts[:,:3]
+            curr_pts = curr_pts[final_mask.flatten()].unsqueeze(0)
+
+            # 随机挑选4096对点云, 计算当前帧的点云和warped_pts之间的变换矩阵
+            rand_idx = torch.randperm(curr_pts.shape[1])[:512]
+            adj_transf = procrustes(warped_pts[:,rand_idx,:], curr_pts[:,rand_idx,:])[1]
+
+            # Report Progress
+            if config['report_iter_progress']:
+                if config['use_wandb']:
+                    report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
+                                    wandb_run=wandb_run, wandb_step=wandb_tracking_step, wandb_save_qual=config['wandb']['save_qual'])
+                else:
+                    report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
+
             # Copy over the best candidate rotation & translation
             with torch.no_grad():
-                params['cam_unnorm_rots'][..., time_idx] = candidate_cam_unnorm_rot
-                params['cam_trans'][..., time_idx] = candidate_cam_tran
-        elif time_idx > 0 and config['tracking']['use_gt_poses']:
-            with torch.no_grad():
-                # Get the ground truth pose relative to frame 0
-                rel_w2c = curr_gt_w2c[-1]
-                rel_w2c_rot = rel_w2c[:3, :3].unsqueeze(0).detach()
-                rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
-                rel_w2c_tran = rel_w2c[:3, 3].detach()
-                # Update the camera parameters
-                params['cam_unnorm_rots'][..., time_idx] = rel_w2c_rot_quat
-                params['cam_trans'][..., time_idx] = rel_w2c_tran
+                params['cam_unnorm_rots'][..., time_idx] = matrix_to_quaternion(adj_transf[0,:3, :3])
+                params['cam_trans'][..., time_idx] = adj_transf[0, :3, 3]
+
+
+
         # Update the runtime numbers
         tracking_end_time = time.time()
         tracking_frame_time_sum += tracking_end_time - tracking_start_time
@@ -786,6 +805,9 @@ def rgbd_slam(config: dict):
                                                       config['mapping']['sil_thres'], time_idx,
                                                       config['mean_sq_dist_method'])
                 post_num_pts = params['means3D'].shape[0]
+
+                
+
                 if config['use_wandb']:
                     wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
                                    "Mapping/step": wandb_time_step})
@@ -819,7 +841,7 @@ def rgbd_slam(config: dict):
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
             for iter in range(num_iters_mapping):  # 60 in config file
-                iter_start_time = time.time()
+                track_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
                 rand_idx = np.random.randint(0, len(selected_keyframes))
                 selected_rand_keyframe_idx = selected_keyframes[rand_idx]
@@ -874,7 +896,7 @@ def rgbd_slam(config: dict):
                         progress_bar.update(1)
                 # Update the runtime numbers
                 iter_end_time = time.time()
-                mapping_iter_time_sum += iter_end_time - iter_start_time
+                mapping_iter_time_sum += iter_end_time - track_start_time
                 mapping_iter_time_count += 1
             if num_iters_mapping > 0:
                 progress_bar.close()
