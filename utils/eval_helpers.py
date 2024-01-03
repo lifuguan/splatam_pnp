@@ -191,7 +191,7 @@ def report_progress(params, data, i, progress_bar, iter_time_idx, sil_thres, eve
             if iter_time_idx > 0:
                 # Calculate relative pose error
                 rel_gt_w2c = relative_transformation(gt_w2c_list[-2], gt_w2c_list[-1])
-                rel_est_w2c = relative_transformation(latest_est_w2c_list[-2], latest_est_w2c_list[-1])
+                rel_est_w2c = relative_transformation(latest_est_w2c_list[-2], latest_est_w2c_list[-1]) # 绝对变换-》相对变换
                 rel_pt_error = torch.sqrt((rel_gt_w2c[0,3] - rel_est_w2c[0,3])**2 + (rel_gt_w2c[1,3] - rel_est_w2c[1,3])**2 + (rel_gt_w2c[2,3] - rel_est_w2c[2,3])**2)
             else:
                 rel_pt_error = torch.zeros(1).float()

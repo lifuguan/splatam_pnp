@@ -4,6 +4,7 @@ import shutil
 import sys
 import time
 from importlib.machinery import SourceFileLoader
+import scipy
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,8 +43,9 @@ from utils.keyframe_selection import keyframe_selection_overlap
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
-    transform_to_frame, l1_loss_v1, matrix_to_quaternion, procrustes
+    transform_to_frame, l1_loss_v1, matrix_to_quaternion, procrustes, scipy_procrustes, 
 )
+from datasets.gradslam_datasets.geometryutils import inverse_transfom_3d
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
@@ -685,8 +687,8 @@ def rgbd_slam(config: dict):
         # Initialize Mapping Data for selected frame
         curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': iter_time_idx, 'intrinsics': intrinsics, 
                      'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
-        last_frame_data = {'cam': cam, 'im': last_frame_color, 'depth': last_frame_depth, 'id': iter_time_idx,
-                     'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
+        last_frame_data = {'cam': cam, 'im': last_frame_color, 'depth': last_frame_depth, 'id': iter_time_idx-1,
+                     'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c[:-1]}
 
         tracking_curr_data, tracking_last_data = curr_data, last_frame_data
 
@@ -705,6 +707,7 @@ def rgbd_slam(config: dict):
 
             raft_inputs = raft_transforms(tracking_curr_data['im'].unsqueeze(0), tracking_last_data['im'].unsqueeze(0))
             optical_flow = raft(raft_inputs[0], raft_inputs[1], num_flow_updates=12)[-1]
+            tracking_last_data['optical_flow'] = optical_flow
             curr_pts, curr_depth, curr_mask = get_render_depth(tracking_curr_data, config)
             last_pts, last_depth, last_mask = get_render_depth(tracking_last_data, config)
             final_mask = curr_mask & last_mask
@@ -746,21 +749,18 @@ def rgbd_slam(config: dict):
             curr_pts = curr_pts[final_mask.flatten()].unsqueeze(0)
 
             # 随机挑选4096对点云, 计算当前帧的点云和warped_pts之间的变换矩阵
-            rand_idx = torch.randperm(curr_pts.shape[1])[:512]
-            adj_transf = procrustes(warped_pts[:,rand_idx,:], curr_pts[:,rand_idx,:])[1]
+            rand_idx = torch.randperm(curr_pts.shape[1])[:2048]
+            # a, b, c = scipy_procrustes(warped_pts[0,rand_idx,:].detach().cpu().numpy(),curr_pts[0,rand_idx,:].detach().cpu().numpy())
+            rel_r_t = procrustes(warped_pts[:,rand_idx,:], curr_pts[:,rand_idx,:])[1]
 
-            # Report Progress
-            if config['report_iter_progress']:
-                if config['use_wandb']:
-                    report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
-                                    wandb_run=wandb_run, wandb_step=wandb_tracking_step, wandb_save_qual=config['wandb']['save_qual'])
-                else:
-                    report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
 
+            abs_r_t = torch.mm(tracking_last_data['iter_gt_w2c_list'][-1], rel_r_t[0])
+    
             # Copy over the best candidate rotation & translation
             with torch.no_grad():
-                params['cam_unnorm_rots'][..., time_idx] = matrix_to_quaternion(adj_transf[0,:3, :3])
-                params['cam_trans'][..., time_idx] = adj_transf[0, :3, 3]
+                params['cam_unnorm_rots'][..., time_idx] = matrix_to_quaternion(abs_r_t[:3, :3])
+                params['cam_trans'][..., time_idx] = abs_r_t[:3, 3]
+
 
 
 
