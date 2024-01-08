@@ -199,12 +199,60 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, mea
     else:
         return params, variables, intrinsics, w2c, cam
 
+def optical_flow_warping(x, flo, pad_mode="zeros"):
+    """
+    warp an image/tensor (im2) back to im1, according to the optical flow
+
+    x: [B, C, H, W] (im2)
+    flo: [B, 2, H, W] flow
+    pad_mode (optional): ref to https://pytorch.org/docs/stable/nn.functional.html#grid-sample
+        "zeros": use 0 for out-of-bound grid locations,
+        "border": use border values for out-of-bound grid locations
+    """
+    B, C, H, W = x.size()
+    # mesh grid
+    xx = torch.arange(0, W).view(1, -1).repeat(H, 1)
+    yy = torch.arange(0, H).view(-1, 1).repeat(1, W)
+    xx = xx.view(1, 1, H, W).repeat(B, 1, 1, 1)
+    yy = yy.view(1, 1, H, W).repeat(B, 1, 1, 1)
+    grid = torch.cat((xx, yy), 1).float().to(x.device)
+
+    vgrid = grid + flo  # warp后，新图每个像素对应原图的位置
+
+    # scale grid to [-1,1]
+    vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :].clone() / max(W - 1, 1) - 1.0
+    vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :].clone() / max(H - 1, 1) - 1.0
+
+    vgrid = vgrid.permute(0, 2, 3, 1)
+    output = F.grid_sample(x, vgrid, padding_mode=pad_mode)
+
+    mask = torch.ones(x.size(), device=x.device)
+    mask = F.grid_sample(mask, vgrid)
+
+    mask[mask < 0.9999] = 0
+    mask[mask > 0] = 1
+
+    return output * mask
+
 def get_render_depth(tracking_data, config):
     cam = tracking_data['cam']
     gt_depth = tracking_data['depth']
     color = tracking_data['im']
     intrinsics = tracking_data['intrinsics']
     w2c = torch.eye(4).cuda().float()
+
+    if 'optical_flow' in tracking_data.keys():
+        optical_flow = tracking_data['optical_flow']
+        warp_depth = optical_flow_warping(gt_depth.unsqueeze(0), optical_flow)
+        # grid_y, grid_x = torch.meshgrid(torch.arange(gt_depth.shape[1]), torch.arange(gt_depth.shape[2]))
+        # grid = torch.stack((grid_x, grid_y), dim=2).float().to(optical_flow.device)  # 形状为 (H, W, 2)
+        # warped_grid = grid + optical_flow.permute(1,2,0)  
+        # warped_grid_normalized = warped_grid / torch.tensor([gt_depth.shape[2] - 1, gt_depth.shape[1] - 1], device=optical_flow.device)
+        # warp_depth = F.grid_sample(gt_depth.unsqueeze(0), warped_grid_normalized.unsqueeze(0), align_corners=True)[0]
+        warp_pt_cld, _ = get_pointcloud(color, warp_depth, intrinsics, w2c, 
+                                                    mask=None, compute_mean_sq_dist=True, 
+                                                    mean_sq_dist_method=config['mean_sq_dist_method'])
+
     # Get Initial Point Cloud (PyTorch CUDA Tensor)
     mask = (gt_depth > 0) # Mask out invalid depth values
     mask = mask.reshape(-1)
@@ -238,7 +286,10 @@ def get_render_depth(tracking_data, config):
     nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
     mask = mask.reshape(nan_mask.shape) & nan_mask
     mask = mask & presence_sil_mask
-    return init_pt_cld, depth, mask
+    if 'optical_flow' in tracking_data.keys():
+        return init_pt_cld, depth, mask, warp_depth, warp_pt_cld
+    else:
+        return init_pt_cld, depth, mask
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1,ignore_outlier_depth_loss, tracking=False, 
@@ -697,8 +748,8 @@ def rgbd_slam(config: dict):
         
         # Initialize the camera pose for the current frame
         # 因为使用PNP，所以不需要恒定速度模型
-        # if time_idx > 0:
-        #     params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'])
+        if time_idx > 0:
+            params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'])
 
         # Tracking
         tracking_start_time = time.time()
@@ -708,8 +759,8 @@ def rgbd_slam(config: dict):
             raft_inputs = raft_transforms(tracking_curr_data['im'].unsqueeze(0), tracking_last_data['im'].unsqueeze(0))
             optical_flow = raft(raft_inputs[0], raft_inputs[1], num_flow_updates=12)[-1]
             tracking_last_data['optical_flow'] = optical_flow
-            curr_pts, curr_depth, curr_mask = get_render_depth(tracking_curr_data, config)
-            last_pts, last_depth, last_mask = get_render_depth(tracking_last_data, config)
+            last_pts, last_render_depth, last_mask, warp_depth, warped_pts = get_render_depth(tracking_last_data, config)
+            curr_pts, curr_render_depth, curr_mask = get_render_depth(tracking_curr_data, config)
             final_mask = curr_mask & last_mask
             h,w = optical_flow.shape[-2:]
 
@@ -717,31 +768,30 @@ def rgbd_slam(config: dict):
 
             if True:
                 # 计算光流的方向和强度
-                flow_magnitude = np.sqrt(np_flow[:, :, 0] ** 2 + np_flow[:, :, 1] ** 2)
                 flow_angle = np.arctan2(np_flow[:, :, 1], np_flow[:, :, 0])
 
                 # 创建颜色映射
                 cmap = plt.cm.get_cmap('hsv')
 
-                fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                fig, axs = plt.subplots(2, 2, figsize=(10, 10))
                 # Plotting depth map a
-                axs[0].imshow(last_depth.detach().cpu()[0], cmap='gray')
-                axs[0].set_title('Last Depth Map')
+                axs[0,0].imshow(last_render_depth.detach().cpu()[0], cmap='gray')
+                axs[0,0].set_title('Last Depth Map')
+                axs[1,0].imshow(warp_depth[0][0].detach().cpu(), cmap='gray')
+                axs[1,0].set_title('Warp Depth Map')
 
                 # Plotting depth map b
-                axs[1].imshow(curr_depth.detach().cpu()[0], cmap='gray')
-                axs[1].set_title('Current Depth Map')
+                axs[0,1].imshow(curr_render_depth.detach().cpu()[0], cmap='gray')
+                axs[0,1].set_title('Current Depth Map')
 
                 # Plotting optical flow map c
-                axs[2].imshow(flow_angle, cmap=cmap) # 使用角度作为颜色映射
-                axs[2].set_title('Optical Flow Map')
+                axs[1,1].imshow(flow_angle, cmap=cmap) # 使用角度作为颜色映射
+                axs[1,1].set_title('Optical Flow Map')
 
                 # 可视化光流
                 plt.savefig(f'work_dirs/visualize_{time_idx}.png')
 
-            last_pts = last_pts.reshape(h,w,-1).unsqueeze(0).permute(0,3,1,2)
-            warped_pts = F.grid_sample(last_pts, optical_flow.permute(0,2,3,1), mode='bilinear', padding_mode='border')
-            warped_pts = warped_pts.permute(0,2,3,1).reshape(h*w,-1)[:,:3]
+            warped_pts = warped_pts[:,:3]
             warped_pts = warped_pts[final_mask.flatten()].unsqueeze(0)
 
             # 选择当前帧的点云
@@ -749,19 +799,83 @@ def rgbd_slam(config: dict):
             curr_pts = curr_pts[final_mask.flatten()].unsqueeze(0)
 
             # 随机挑选4096对点云, 计算当前帧的点云和warped_pts之间的变换矩阵
-            rand_idx = torch.randperm(curr_pts.shape[1])[:2048]
+            rand_idx = torch.randperm(curr_pts.shape[1])[:1024]
             # a, b, c = scipy_procrustes(warped_pts[0,rand_idx,:].detach().cpu().numpy(),curr_pts[0,rand_idx,:].detach().cpu().numpy())
             rel_r_t = procrustes(warped_pts[:,rand_idx,:], curr_pts[:,rand_idx,:])[1]
-
 
             abs_r_t = torch.mm(tracking_last_data['iter_gt_w2c_list'][-1], rel_r_t[0])
     
             # Copy over the best candidate rotation & translation
-            with torch.no_grad():
-                params['cam_unnorm_rots'][..., time_idx] = matrix_to_quaternion(abs_r_t[:3, :3])
-                params['cam_trans'][..., time_idx] = abs_r_t[:3, 3]
+            # with torch.no_grad():
+            #     params['cam_unnorm_rots'][..., time_idx] = matrix_to_quaternion(abs_r_t[:3, :3])
+            #     params['cam_trans'][..., time_idx] = abs_r_t[:3, 3]
 
+            # # Reset Optimizer & Learning Rates for tracking
+            # optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
+            # # Keep Track of Best Candidate Rotation & Translation
+            # candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
+            # candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
+            # current_min_loss = float(1e20)
+            # # Tracking Optimization
+            # iter = 0
+            # do_continue_slam = False
+            # num_iters_tracking = 20
+            # progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+            # while True:
+            #     iter_start_time = time.time()
+            #     # Loss for current frame
+            #     loss, variables, losses = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
+            #                                        config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
+            #                                        config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
+            #                                        plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
+            #                                        tracking_iteration=iter)
+            #     if config['use_wandb']:
+            #         # Report Loss
+            #         wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
+            #     # Backprop
+            #     loss.backward()
+            #     # Optimizer Update
+            #     optimizer.step()
+            #     optimizer.zero_grad(set_to_none=True)
+            #     with torch.no_grad():
+            #         # Save the best candidate rotation & translation
+            #         if loss < current_min_loss:
+            #             current_min_loss = loss
+            #             candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
+            #             candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
+            #         # Report Progress
+            #         if config['report_iter_progress']:
+            #             if config['use_wandb']:
+            #                 report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
+            #                                 wandb_run=wandb_run, wandb_step=wandb_tracking_step, wandb_save_qual=config['wandb']['save_qual'])
+            #             else:
+            #                 report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
+            #         else:
+            #             progress_bar.update(1)
+            #     # Update the runtime numbers
+            #     iter_end_time = time.time()
+            #     tracking_iter_time_sum += iter_end_time - iter_start_time
+            #     tracking_iter_time_count += 1
+            #     # Check if we should stop tracking
+            #     iter += 1
+            #     if iter == num_iters_tracking:
+            #         if losses['depth'] < config['tracking']['depth_loss_thres'] and config['tracking']['use_depth_loss_thres']:
+            #             break
+            #         elif config['tracking']['use_depth_loss_thres'] and not do_continue_slam:
+            #             do_continue_slam = True
+            #             progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+            #             num_iters_tracking = 2*num_iters_tracking
+            #             if config['use_wandb']:
+            #                 wandb_run.log({"Tracking/Extra Tracking Iters Frames": time_idx,
+            #                             "Tracking/step": wandb_time_step})
+            #         else:
+            #             break
 
+            # progress_bar.close()
+            # # Copy over the best candidate rotation & translation
+            # with torch.no_grad():
+            #     params['cam_unnorm_rots'][..., time_idx] = candidate_cam_unnorm_rot
+            #     params['cam_trans'][..., time_idx] = candidate_cam_tran
 
 
         # Update the runtime numbers
